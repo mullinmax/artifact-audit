@@ -1,20 +1,79 @@
 
-#!/bin/bash
+#!/usr/bin/env bash
 
 set -euo pipefail
 
-# Ensure GH is authenticated
-gh auth status > /dev/null
+# Global state containers
+declare -ga all_artifacts=()
+declare -gA repo_totals=()
+declare -gA latest_releases=()
+declare -ga target_repos=()
 
-echo "Fetching artifact usage for all accessible repositories..."
-echo ""
+USERNAME=""
+PROCESS_PERSONAL=true
+PROCESS_ORGS=true
 
-# Arrays to store data
-declare -a all_artifacts=()
-declare -A repo_totals=()
-declare -A latest_releases=()
+function init_state() {
+    all_artifacts=()
+    repo_totals=()
+    latest_releases=()
+}
 
-USERNAME=$(gh api user | jq -r .login)
+function bytes_to_mb() {
+    local bytes="${1:-0}"
+    awk -v bytes="$bytes" 'BEGIN { printf "%.2f", bytes / 1024 / 1024 }'
+}
+
+function verify_gh_auth() {
+    if ! gh auth status > /dev/null 2>&1; then
+        echo "❌ GitHub CLI (gh) is not authenticated. Run 'gh auth login' first." >&2
+        exit 1
+    fi
+}
+
+function parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --repo)
+                if [[ $# -lt 2 ]]; then
+                    echo "--repo requires an argument like owner/name" >&2
+                    exit 1
+                fi
+                target_repos+=("$2")
+                shift 2
+                ;;
+            --skip-personal)
+                PROCESS_PERSONAL=false
+                shift
+                ;;
+            --skip-orgs)
+                PROCESS_ORGS=false
+                shift
+                ;;
+            -h|--help)
+                print_help
+                exit 0
+                ;;
+            *)
+                echo "Unknown argument: $1" >&2
+                print_help >&2
+                exit 1
+                ;;
+        esac
+    done
+}
+
+function print_help() {
+    cat <<'USAGE'
+Usage: ./artifact_audit.sh [options]
+
+Options:
+  --repo <owner/name>   Limit the audit to a specific repository. Repeatable.
+  --skip-personal       Skip processing of personal repositories.
+  --skip-orgs           Skip processing of organization repositories.
+  -h, --help            Show this help message.
+USAGE
+}
 
 # Function to get latest release tag for a repository
 function get_latest_release() {
@@ -62,7 +121,7 @@ function process_repo() {
         return
     fi
 
-    local repo_total_mb=0
+    local repo_total_bytes=0
 
     # Process artifacts
     while IFS= read -r artifact; do
@@ -76,42 +135,50 @@ function process_repo() {
 
         # Skip if no valid size or zero bytes
         if [[ "$artifact_size_bytes" =~ ^[0-9]+$ ]] && [ "$artifact_size_bytes" -gt 0 ]; then
-            size_mb=$(echo "scale=2; $artifact_size_bytes / 1024 / 1024" | bc)
+            size_mb=$(bytes_to_mb "$artifact_size_bytes")
             
             # Store artifact info: repo|id|name|size_mb|created_at|pr_number|size_bytes
             all_artifacts+=("$full_repo|$artifact_id|$artifact_name|$size_mb|$created_at|$pr_number|$artifact_size_bytes")
             
-            repo_total_mb=$(echo "$repo_total_mb + $size_mb" | bc)
+            repo_total_bytes=$((repo_total_bytes + artifact_size_bytes))
         fi
     done < <(echo "$artifact_json" | jq -c '.artifacts[]')
-    
+
     # Store repo total if it has artifacts
-    if (( $(echo "$repo_total_mb > 0" | bc -l) )); then
-        repo_totals["$full_repo"]="$repo_total_mb"
+    if (( repo_total_bytes > 0 )); then
+        repo_totals["$full_repo"]="$repo_total_bytes"
     fi
 }
 
 # Function to process all repositories
 function process_all_repos() {
-    # Get all personal repositories
-    echo "📂 Getting personal repositories for $USERNAME..."
-    
-    while IFS= read -r repo; do
-        [ -n "$repo" ] && process_repo "$repo"
-    done < <(gh repo list "$USERNAME" --limit 1000 --json nameWithOwner --jq '.[].nameWithOwner')
+    if [ ${#target_repos[@]} -gt 0 ]; then
+        echo "🎯 Auditing specific repositories..."
+        for repo in "${target_repos[@]}"; do
+            process_repo "$repo"
+        done
+        return
+    fi
 
-    # Get all organizations and their repos
-    echo ""
-    echo "👥 Fetching organizations..."
-    
-    while IFS= read -r org; do
-        if [ -n "$org" ]; then
-            echo "📂 Repos in org: $org"
-            while IFS= read -r repo; do
-                [ -n "$repo" ] && process_repo "$repo"
-            done < <(gh repo list "$org" --limit 1000 --json nameWithOwner --jq '.[].nameWithOwner')
-        fi
-    done < <(gh api user/orgs --paginate | jq -r '.[].login')
+    if [[ "$PROCESS_PERSONAL" == true ]]; then
+        echo "📂 Getting personal repositories for $USERNAME..."
+        while IFS= read -r repo; do
+            [ -n "$repo" ] && process_repo "$repo"
+        done < <(gh repo list "$USERNAME" --limit 1000 --json nameWithOwner --jq '.[].nameWithOwner')
+    fi
+
+    if [[ "$PROCESS_ORGS" == true ]]; then
+        echo ""
+        echo "👥 Fetching organizations..."
+        while IFS= read -r org; do
+            if [ -n "$org" ]; then
+                echo "📂 Repos in org: $org"
+                while IFS= read -r repo; do
+                    [ -n "$repo" ] && process_repo "$repo"
+                done < <(gh repo list "$org" --limit 1000 --json nameWithOwner --jq '.[].nameWithOwner')
+            fi
+        done < <(gh api user/orgs --paginate | jq -r '.[].login')
+    fi
 }
 
 # Function to display artifacts by repository
@@ -128,8 +195,10 @@ function display_artifacts() {
     # Sort repositories by total size (largest first)
     for repo in "${!repo_totals[@]}"; do
         echo "$repo ${repo_totals[$repo]}"
-    done | sort -k2 -nr | while read -r repo total; do
-        printf "📂 %-50s %s MB\n" "$repo" "$total"
+    done | sort -k2 -nr | while read -r repo total_bytes; do
+        local total_mb
+        total_mb=$(bytes_to_mb "$total_bytes")
+        printf "📂 %-50s %s MB\n" "$repo" "$total_mb"
     done
 }
 
@@ -146,7 +215,7 @@ function calculate_total_storage() {
     done
     
     local total_mb
-    total_mb=$(echo "scale=2; $total_bytes / 1024 / 1024" | bc)
+    total_mb=$(bytes_to_mb "$total_bytes")
     echo "🧮 Total Storage Used: $total_mb MB"
 }
 
@@ -206,9 +275,20 @@ function review_and_delete() {
     done
 }
 
-# Main execution
-echo "Starting artifact audit..."
-process_all_repos
-display_artifacts
-calculate_total_storage
-review_and_delete
+function main() {
+    parse_args "$@"
+    verify_gh_auth
+    init_state
+
+    USERNAME=$(gh api user | jq -r .login)
+
+    echo "Starting artifact audit..."
+    process_all_repos
+    display_artifacts
+    calculate_total_storage
+    review_and_delete
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
